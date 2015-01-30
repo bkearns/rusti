@@ -4,7 +4,9 @@ A REPL for the Rust programming language.
 
 Rusti is a work in progress.
 
-## Building
+Current Status
+--------------
+[![Build Status](https://secure.travis-ci.org/bkearns/rusti.png)](http://travis-ci.org/bkearns/rusti)
 
 Rusti builds with the latest Rust nightly, using the Cargo build system.
 
