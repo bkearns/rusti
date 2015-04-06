@@ -1,12 +1,10 @@
-#![feature(io)]
-
-use std::old_io::process::Command;
+use std::process::Command;
 
 fn repl_run(args: &[&str]) -> String {
-    let rusti = if cfg!(windows) { "target/rusti.exe" } else { "target/rusti" };
+    let rusti = if cfg!(windows) { "target/debug/rusti.exe" } else { "target/debug/rusti" };
 
     match Command::new(rusti).args(args).env("HOME", "data").output() {
-        Ok(out) => String::from_utf8(out.output).unwrap(),
+        Ok(out) => String::from_utf8(out.stdout).unwrap(),
         Err(e) => panic!("failed to spawn process: {}", e)
     }
 }
@@ -27,18 +25,20 @@ fn repl_file(path: &str) -> String {
 fn test_eval() {
     assert_eq!(repl_eval(r#"println!("Hello, world!");"#), "Hello, world!\n");
     assert_eq!(repl_eval(r#"vec![1, 2, 3]"#), "[1, 2, 3]\n");
-    assert_eq!(repl_eval(r#""foo".to_string().as_slice()"#), "\"foo\"\n");
     assert_eq!(repl_eval("let a = 1; a"), "1\n");
     assert_eq!(repl_eval("fn foo() -> u32 { 2 } foo()"), "2\n");
     assert_eq!(repl_eval("fn foo() -> u32 { 3 }; foo()"), "3\n");
-    assert_eq!(repl_eval(
-        "#[macro_use] extern crate rustc_bitflags; \
-        bitflags!{ flags Flags: u32 { const A = 4 } } A.bits"), "4\n");
 }
 
 #[test]
 fn test_file() {
     assert_eq!(repl_file("data/test_file.rs"), "foo\n123 = i32\nbar\n");
+}
+
+#[test]
+fn test_print() {
+    assert_eq!(repl_cmd(".print 1"), "1\n");
+    assert_eq!(repl_cmd(r#".p "Hello!""#), "Hello!\n");
 }
 
 #[test]

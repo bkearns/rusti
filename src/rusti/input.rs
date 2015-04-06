@@ -8,43 +8,45 @@
 
 //! Parsing REPL input statements, including Rust code and `rusti` commands.
 
+use std::borrow::Cow;
 use std::borrow::Cow::*;
-use std::old_io::{BufferedReader, EndOfFile, File, IoResult, stderr};
-use std::old_io::util::NullWriter;
+use std::ffi::AsOsStr;
+use std::fs::File;
+use std::io::{self, BufRead, BufReader};
 use std::mem::swap;
-use std::string::CowString;
 use std::sync::mpsc::{channel, Sender};
 use std::thread::Builder;
 
-use super::rustc;
+use rustc;
 
-use super::syntax::ast::Decl_::*;
-use super::syntax::ast::Item_::*;
-use super::syntax::ast::MacStmtStyle::*;
-use super::syntax::ast::Stmt_::*;
-use super::syntax::codemap::{BytePos, CodeMap, Span};
-use super::syntax::diagnostic::{Auto, Emitter, EmitterWriter};
-use super::syntax::diagnostic::{Level, RenderSpan, mk_handler};
-use super::syntax::diagnostic::Level::*;
-use super::syntax::diagnostics::registry::Registry;
-use super::syntax::parse::classify;
-use super::syntax::parse::{new_parse_sess, string_to_filemap, filemap_to_parser};
-use super::syntax::parse::attr::ParserAttr;
-use super::syntax::parse::token;
+use syntax::ast::Decl_::*;
+use syntax::ast::Item_::*;
+use syntax::ast::MacStmtStyle::*;
+use syntax::ast::Stmt_::*;
+use syntax::codemap::{BytePos, CodeMap, Span};
+use syntax::diagnostic::{Auto, Emitter, EmitterWriter};
+use syntax::diagnostic::{Level, RenderSpan, mk_handler};
+use syntax::diagnostic::Level::*;
+use syntax::diagnostics::registry::Registry;
+use syntax::parse::classify;
+use syntax::parse::{new_parse_sess, string_to_filemap, filemap_to_parser};
+use syntax::parse::attr::ParserAttr;
+use syntax::parse::token;
 
-use super::readline;
+use readline;
+use repl::{lookup_command, CmdArgs};
 
-pub use self::InputResult::*;
+use self::InputResult::*;
 
 pub struct FileReader {
-    reader: BufferedReader<File>,
+    reader: BufReader<File>,
     buffer: String,
 }
 
 impl FileReader {
     pub fn new(f: File) -> FileReader {
         FileReader{
-            reader: BufferedReader::new(f),
+            reader: BufReader::new(f),
             buffer: String::new(),
         }
     }
@@ -53,48 +55,42 @@ impl FileReader {
         let mut buf = String::new();
 
         loop {
-            let mut line = match self.read_line() {
-                Ok(line) => line,
-                Err(ref e) if e.kind == EndOfFile => break,
+            let mut line = String::new();
+
+            match self.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => (),
                 Err(e) => return InputError(Some(Owned(format!("{}", e)))),
             };
 
-            if is_command(&line[]) {
+            if is_command(&line) {
                 if buf.is_empty() {
-                    truncate_newline(&mut line);
-                    return parse_command(&line[]);
+                    return parse_command(&line, true);
                 } else {
                     self.buffer = line;
                     break;
                 }
             } else {
-                buf.push_str(&line[]);
+                buf.push_str(&line);
             }
         }
 
         if !buf.is_empty() {
-            parse_program(&buf[], false,
-                self.reader.get_ref().path().as_str())
+            parse_program(&buf, false,
+                self.reader.get_ref().path()
+                    .and_then(|p| p.as_os_str().to_str()))
         } else {
             Eof
         }
     }
 
-    fn read_line(&mut self) -> IoResult<String> {
+    fn read_line(&mut self, buf: &mut String) -> io::Result<usize> {
         if self.buffer.is_empty() {
-            self.reader.read_line()
+            self.reader.read_line(buf)
         } else {
-            let mut buf = String::new();
-            swap(&mut buf, &mut self.buffer);
-            Ok(buf)
+            swap(buf, &mut self.buffer);
+            Ok(buf.len())
         }
-    }
-}
-
-fn truncate_newline(s: &mut String) {
-    if s.ends_with("\n") {
-        let n = s.len() - 1;
-        s.truncate(n);
     }
 }
 
@@ -120,19 +116,19 @@ impl InputReader {
             None => return Eof,
         };
 
-        self.buffer.push_str(&line[]);
+        self.buffer.push_str(&line);
 
         if self.buffer.is_empty() {
             return Empty;
         }
 
-        readline::push_history(&line[]);
+        readline::push_history(&line);
 
-        let res = if is_command(&self.buffer[]) {
-            parse_command(&self.buffer[])
+        let res = if is_command(&self.buffer) {
+            parse_command(&self.buffer, true)
         } else {
             self.buffer.push('\n');
-            parse_program(&self.buffer[], true, None)
+            parse_program(&self.buffer, true, None)
         };
 
         match res {
@@ -162,23 +158,23 @@ impl InputReader {
             };
 
             if !line.is_empty() {
-                readline::push_history(&line[]);
+                readline::push_history(&line);
             }
 
             if line == ".q" || line == ":q" {
                 return Empty;
             } else if line == "." {
-                return parse_program(&buf[], true, None);
+                return parse_program(&buf, true, None);
             }
 
-            buf.push_str(&line[]);
+            buf.push_str(&line);
             buf.push('\n');
         }
     }
 }
 
 /// Possible results from reading input from `InputReader`
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum InputResult {
     /// rusti command as input; (name, rest of line)
     Command(String, Option<String>),
@@ -192,11 +188,11 @@ pub enum InputResult {
     Eof,
     /// Error while parsing input; a Rust parsing error will have printed out
     /// error messages and therefore contain no error message.
-    InputError(Option<CowString<'static>>),
+    InputError(Option<Cow<'static, str>>),
 }
 
 /// Represents an input program
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Input {
     /// Module attributes
     pub attributes: Vec<String>,
@@ -230,30 +226,41 @@ pub fn is_command(line: &str) -> bool {
 
 /// Parses a line of input as a command.
 /// Returns either a `Command` value or an `InputError` value.
-pub fn parse_command(line: &str) -> InputResult {
+pub fn parse_command(line: &str, filter: bool) -> InputResult {
+    debug!("parse_command: {:?}", line);
     if !is_command(line) {
         return InputError(Some(Borrowed("command must begin with `.` or `:`")));
     }
 
     let line = &line[1..];
-    let mut words = line.trim_right_matches(' ').splitn(1, ' ');
+    let mut words = line.trim_right().splitn(2, ' ');
 
-    let cmd = match words.next() {
-        Some(cmd) if !cmd.is_empty() => cmd.to_string(),
+    let name = match words.next() {
+        Some(name) if !name.is_empty() => name,
         _ => return InputError(Some(Borrowed("expected command name"))),
     };
 
-    let args = words.next().map(|s| s.to_string());
+    let cmd = match lookup_command(name) {
+        Some(cmd) => cmd,
+        None => return InputError(Some(Owned(
+            format!("unrecognized command: {}", name))))
+    };
 
-    Command(cmd, args)
-}
+    let args = words.next();
 
-/// Parses a line of input.
-pub fn parse_input(line: &str) -> InputResult {
-    if is_command(line) {
-        parse_command(line)
-    } else {
-        parse_program(line, false, None)
+    match cmd.accepts {
+        CmdArgs::Nothing if args.is_some() => InputError(
+            Some(Owned(format!("command `{}` takes no arguments", cmd.name)))),
+        CmdArgs::Expr if args.is_none() => InputError(
+            Some(Owned(format!("command `{}` expects an expression", cmd.name)))),
+        CmdArgs::Expr => {
+            let args = args.unwrap();
+            match parse_program(args, filter, None) {
+                Program(_) => Command(name.to_string(), Some(args.to_string())),
+                i => i,
+            }
+        }
+        _ => Command(name.to_string(), args.map(|s| s.to_string()))
     }
 }
 
@@ -265,8 +272,9 @@ pub fn parse_input(line: &str) -> InputResult {
 /// and `InputError` will be returned.
 pub fn parse_program(code: &str, filter: bool, filename: Option<&str>) -> InputResult {
     let (tx, rx) = channel();
+    let (err_tx, err_rx) = channel();
 
-    let task = Builder::new().stderr(Box::new(NullWriter));
+    let task = Builder::new().name("parse_program".to_string());
 
     // Items are not returned in data structures; nor are they converted back
     // into strings. Instead, to preserve user input formatting, we use
@@ -278,9 +286,12 @@ pub fn parse_program(code: &str, filter: bool, filename: Option<&str>) -> InputR
     let code = code.to_string();
     let filename = filename.unwrap_or("<input>").to_string();
 
-    let res = task.scoped(move || {
+    let handle = task.spawn(move || {
+        if !log_enabled!(::log::LogLevel::Error) {
+            io::set_panic(Box::new(io::sink()));
+        }
         let mut input = Input::new();
-        let handler = mk_handler(false, Box::new(ErrorEmitter::new(tx, filter)));
+        let handler = mk_handler(false, Box::new(ErrorEmitter::new(err_tx, filter)));
         let mut sess = new_parse_sess();
 
         sess.span_diagnostic.handler = handler;
@@ -300,23 +311,18 @@ pub fn parse_program(code: &str, filter: bool, filename: Option<&str>) -> InputR
 
             let lo = p.span.lo;
 
-            let attrs = if p.token == token::Pound {
+            if p.token == token::Pound {
                 if p.look_ahead(1, |t| *t == token::Not) {
                     let _ = p.parse_attribute(true);
                     input.attributes.push(slice(&code, lo, p.last_span.hi));
                     continue;
                 }
-
-                p.parse_outer_attributes()
-            } else {
-                vec![]
-            };
-
-            if p.token == token::Eof {
-                sess.span_diagnostic.handler.fatal("expected item after attributes");
             }
 
-            let stmt = p.parse_stmt(attrs);
+            let stmt = match p.parse_stmt() {
+                None => break,
+                Some(stmt) => stmt,
+            };
 
             let mut hi = None;
 
@@ -368,13 +374,15 @@ pub fn parse_program(code: &str, filter: bool, filename: Option<&str>) -> InputR
 
         input.last_expr = last_expr;
 
-        input
-    }).join();
+        tx.send(input).unwrap();
+    }).unwrap();
 
-    match res {
-        Ok(input) => Program(input),
+    match handle.join() {
+        Ok(_) => {
+            Program(rx.recv().unwrap())
+        }
         Err(_) => {
-            if rx.iter().any(|fatal| fatal) {
+            if err_rx.iter().any(|fatal| fatal) {
                 InputError(None)
             } else {
                 More
@@ -419,6 +427,7 @@ impl Emitter for ErrorEmitter {
                 if msg.contains("un-closed delimiter") ||
                         msg.contains("expected item after attributes") ||
                         msg.contains("unterminated block comment") ||
+                        msg.contains("unterminated block doc-comment") ||
                         msg.contains("unterminated double quote string") ||
                         msg.contains("unterminated double quote byte string") ||
                         msg.contains("unterminated raw string") {

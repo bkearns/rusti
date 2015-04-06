@@ -9,28 +9,35 @@
 //! A REPL for the Rust programming language.
 
 #![crate_name = "rusti"]
-#![feature(unsafe_destructor)]
-#![feature(collections, core, io, libc, os, path, rustc_private, std_misc)]
-#![unstable]
+#![feature(collections, exit_status, file_path, libc, path_ext,
+    rustc_private, set_stdio, std_misc)]
 
 extern crate getopts;
+extern crate libc;
 extern crate rustc;
+extern crate rustc_driver;
+extern crate rustc_lint;
+extern crate rustc_resolve;
 extern crate syntax;
 
 #[macro_use] extern crate log;
+extern crate env_logger;
 
 use getopts::Options;
 
-use std::old_io::fs::PathExtensions;
+use std::fs::PathExt;
+use std::path::PathBuf;
 
 pub mod exec;
 pub mod input;
 pub mod readline;
 pub mod repl;
 
-/// Run `rusti` executable using `os::args`
+/// Run `rusti` executable using `env::args`
 pub fn run() {
-    let args = std::os::args();
+    env_logger::init().unwrap();
+
+    let args = std::env::args().collect::<Vec<_>>();
     let mut opts = Options::new();
 
     opts.optopt("c", "", "Execute a rusti command and exit", "COMMAND");
@@ -40,12 +47,13 @@ pub fn run() {
     opts.optflag("v", "version", "Print version and exit");
     opts.optmulti("L", "", "Add a directory to the library search path", "PATH");
     opts.optflag("", "no-rc", "Do not run $HOME/.rustirc.rs");
+    opts.optopt("", "sysroot", "Use an alternate Rust sysroot", "PATH");
 
     let matches = match opts.parse(args.tail()) {
         Ok(m) => m,
         Err(e) => {
             println!("{}: {}", args[0], e);
-            std::os::set_exit_status(1);
+            std::env::set_exit_status(1);
             return;
         }
     };
@@ -55,7 +63,7 @@ pub fn run() {
         return;
     }
     if matches.opt_present("help") {
-        print_usage(&args[0][], &opts);
+        print_usage(&args[0], &opts);
         return;
     }
 
@@ -65,15 +73,16 @@ pub fn run() {
         !matches.opt_present("e"));
 
     let addl_libs = matches.opt_strs("L");
+    let sysroot = matches.opt_str("sysroot").map(|s| PathBuf::from(&s));
 
-    let mut repl = repl::Repl::new_with_libs(addl_libs);
+    let mut repl = repl::Repl::new_with_libs(addl_libs, sysroot);
 
     if !matches.opt_present("no-rc") {
-        if let Some(p) = std::os::homedir() {
+        if let Some(p) = std::env::home_dir() {
             let rc = p.join(".rustirc.rs");
             if rc.is_file() {
-                if !repl.run_file(rc) {
-                    std::os::set_exit_status(1);
+                if !repl.run_file(&rc) {
+                    std::env::set_exit_status(1);
                     return;
                 }
             }
@@ -81,14 +90,14 @@ pub fn run() {
     }
 
     if let Some(cmd) = matches.opt_str("c") {
-        repl.run_command(&cmd[]);
+        repl.run_command(&cmd);
     } else if let Some(expr) = matches.opt_str("e") {
-        repl.eval(&expr[]);
+        repl.eval(&expr);
     } else if !matches.free.is_empty() {
-        let path = Path::new(&matches.free[0]);
+        let path = PathBuf::from(&matches.free[0]);
 
-        if !repl.run_file(path) {
-            std::os::set_exit_status(1);
+        if !repl.run_file(&path) {
+            std::env::set_exit_status(1);
         }
     }
 
@@ -109,7 +118,7 @@ pub fn version() -> String {
 
 fn print_usage(arg0: &str, opts: &Options) {
     print!("{}", opts.usage(&format!(
-        "Usage: {} [OPTIONS] [FILE]", arg0)[]));
+        "Usage: {} [OPTIONS] [FILE]", arg0)));
 }
 
 fn print_version() {

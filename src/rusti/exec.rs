@@ -8,29 +8,29 @@
 
 //! Rust code parsing and compilation.
 
-extern crate rustc_driver;
-extern crate rustc_resolve;
-
-use std::ffi::{c_str_to_bytes, CString};
-use std::old_io::fs::PathExtensions;
-use std::old_io::util::NullWriter;
+use std::ffi::{AsOsStr, CStr, CString};
+use std::io;
 use std::mem::transmute;
-use std::os::{getenv_as_bytes, split_paths};
-use std::path::BytesContainer;
+use std::path::PathBuf;
+use std::process::Command;
+use std::str::from_utf8;
+use std::sync::mpsc::channel;
 use std::thread::Builder;
 
-use super::rustc;
-use super::rustc::llvm;
-use super::rustc::metadata::cstore::RequireDynamic;
-use super::rustc::middle::ty;
-use super::rustc::session::config::{self, basic_options, build_configuration, Options};
-use super::rustc::session::config::Input;
-use super::rustc::session::build_session;
-use self::rustc_driver::driver;
-use self::rustc_resolve::MakeGlobMap;
+use rustc;
+use rustc_lint;
 
-use super::syntax::ast_map;
-use super::syntax::diagnostics::registry::Registry;
+use rustc::llvm;
+use rustc::metadata::cstore::RequireDynamic;
+use rustc::middle::ty;
+use rustc::session::config::{self, basic_options, build_configuration, Options};
+use rustc::session::config::{Input, UnstableFeatures};
+use rustc::session::build_session;
+use rustc_driver::driver;
+use rustc_resolve::MakeGlobMap;
+
+use syntax::ast_map;
+use syntax::diagnostics::registry::Registry;
 
 // This seems like a such a simple solution that I'm surprised it works.
 #[link(name = "morestack")]
@@ -48,7 +48,7 @@ pub struct ExecutionEngine {
     modules: Vec<llvm::ModuleRef>,
     /// Additional search paths for libraries
     lib_paths: Vec<String>,
-    sysroot: Path,
+    sysroot: PathBuf,
 }
 
 /// A value that can be translated into `ExecutionEngine` input
@@ -68,25 +68,25 @@ impl IntoInput for String {
     }
 }
 
-impl IntoInput for Path {
+impl IntoInput for PathBuf {
     fn into_input(self) -> Input {
         Input::File(self)
     }
 }
 
-type Deps = Vec<Path>;
+type Deps = Vec<PathBuf>;
 
 impl ExecutionEngine {
     /// Constructs a new `ExecutionEngine` with the given library search paths.
-    pub fn new(libs: Vec<String>) -> ExecutionEngine {
-        ExecutionEngine::new_with_input(String::new(), libs)
+    pub fn new(libs: Vec<String>, sysroot: Option<PathBuf>) -> ExecutionEngine {
+        ExecutionEngine::new_with_input(String::new(), libs, sysroot)
     }
 
     /// Constructs a new `ExecutionEngine` with the given starting input
     /// and library search paths.
-    pub fn new_with_input<T>(input: T, libs: Vec<String>) -> ExecutionEngine
+    pub fn new_with_input<T>(input: T, libs: Vec<String>, sysroot: Option<PathBuf>) -> ExecutionEngine
             where T: IntoInput {
-        let sysroot = get_sysroot();
+        let sysroot = sysroot.unwrap_or_else(get_sysroot);
 
         let (llmod, deps) = compile_input(input.into_input(),
             sysroot.clone(), libs.clone())
@@ -165,7 +165,7 @@ impl ExecutionEngine {
     /// Compiles the given input only up to the analysis phase, calling the
     /// given closure with a borrowed reference to the analysis result.
     pub fn with_analysis<F, R, T>(&self, input: T, f: F) -> Option<R>
-            where F: Send, R: Send, T: IntoInput,
+            where F: Send + 'static, R: Send + 'static, T: IntoInput,
             F: for<'tcx> FnOnce(&ty::CrateAnalysis<'tcx>) -> R {
         with_analysis(f, input.into_input(),
             self.sysroot.clone(), self.lib_paths.clone())
@@ -176,7 +176,7 @@ impl ExecutionEngine {
     /// If the function is found, a raw pointer is returned.
     /// If the function is not found, `None` is returned.
     pub fn get_function(&mut self, name: &str) -> Option<*const ()> {
-        let s = CString::from_slice(name.as_bytes());
+        let s = CString::new(name.as_bytes()).unwrap();
 
         for m in self.modules.iter().rev() {
             let fv = unsafe { llvm::LLVMGetNamedFunction(*m, s.as_ptr()) };
@@ -198,7 +198,7 @@ impl ExecutionEngine {
     /// If the global is found, a raw pointer is returned.
     /// If the global is not found, `None` is returned.
     pub fn get_global(&mut self, name: &str) -> Option<*const ()> {
-        let s = CString::from_slice(name.as_bytes());
+        let s = CString::new(name.as_bytes()).unwrap();
 
         for m in self.modules.iter().rev() {
             let gv = unsafe { llvm::LLVMGetNamedGlobal(*m, s.as_ptr()) };
@@ -220,8 +220,15 @@ impl ExecutionEngine {
     fn load_deps(&self, deps: &Deps) {
         for path in deps.iter() {
             debug!("loading crate {}", path.display());
-            let s = CString::from_slice(path.container_as_bytes());
-            let res = unsafe { llvm::LLVMRustLoadDynamicLibrary(s.as_ptr()) };
+
+            let s = match path.as_os_str().to_str() {
+                Some(s) => s,
+                None => panic!(
+                    "Could not convert crate path to UTF-8 string: {:?}", path)
+            };
+            let cs = CString::new(s).unwrap();
+
+            let res = unsafe { llvm::LLVMRustLoadDynamicLibrary(cs.as_ptr()) };
 
             if res == 0 {
                 panic!("Failed to load crate {:?}: {}",
@@ -231,7 +238,6 @@ impl ExecutionEngine {
     }
 }
 
-#[unsafe_destructor]
 impl Drop for ExecutionEngine {
     fn drop(&mut self) {
         unsafe { llvm::LLVMDisposeExecutionEngine(self.ee) };
@@ -241,38 +247,29 @@ impl Drop for ExecutionEngine {
 /// Returns last error from LLVM wrapper code.
 fn llvm_error() -> String {
     String::from_utf8_lossy(
-        unsafe { c_str_to_bytes(&llvm::LLVMRustGetLastError()) }).into_owned()
+        unsafe { CStr::from_ptr(llvm::LLVMRustGetLastError()).to_bytes() })
+        .into_owned()
 }
 
-/// `rustc` uses its own executable path to derive the sysroot.
-/// Because we're not `rustc`, we have to go looking for the sysroot.
-///
-/// To do this, we search the directories in the `PATH` environment variable
-/// for a file named `rustc` (`rustc.exe` on Windows). Upon finding it,
-/// we use the parent directory of that directory as the sysroot.
-///
-/// e.g. if `/usr/local/bin` is in `PATH` and `/usr/local/bin/rustc` is found,
-/// `/usr/local` will be the sysroot.
-fn get_sysroot() -> Path {
-    if let Some(path) = getenv_as_bytes("PATH") {
-        let rustc = if cfg!(windows) { "rustc.exe" } else { "rustc" };
+/// Runs `rustc` to ask for its sysroot path.
+fn get_sysroot() -> PathBuf {
+    let rustc = if cfg!(windows) { "rustc.exe" } else { "rustc" };
 
-        debug!("searching for sysroot in PATH {}",
-            String::from_utf8_lossy(&path[]));
+    let output = match Command::new(rustc).args(&["--print", "sysroot"]).output() {
+        Ok(output) => output.stdout,
+        Err(e) => panic!("failed to run rustc: {}", e),
+    };
 
-        for mut p in split_paths(path).into_iter() {
-            if p.join(rustc).is_file() {
-                debug!("sysroot from PATH entry {}", p.display());
-                p.pop();
-                return p;
-            }
-        }
-    }
+    let path = from_utf8(&output)
+        .ok().expect("sysroot is not valid UTF-8").trim_right_matches(
+            |c| c == '\r' || c == '\n');
 
-    panic!("Could not find sysroot");
+    debug!("using sysroot: {:?}", path);
+
+    PathBuf::from(path)
 }
 
-fn build_exec_options(sysroot: Path, libs: Vec<String>) -> Options {
+fn build_exec_options(sysroot: PathBuf, libs: Vec<String>) -> Options {
     let mut opts = basic_options();
 
     // librustc derives sysroot from the executable name.
@@ -280,7 +277,7 @@ fn build_exec_options(sysroot: Path, libs: Vec<String>) -> Options {
     opts.maybe_sysroot = Some(sysroot);
 
     for p in libs.iter() {
-        opts.search_paths.add_path(&p[]);
+        opts.search_paths.add_path(&p);
     }
 
     // Prefer faster build times
@@ -289,6 +286,9 @@ fn build_exec_options(sysroot: Path, libs: Vec<String>) -> Options {
     // Don't require a `main` function
     opts.crate_types = vec![config::CrateTypeDylib];
 
+    // Allow use of unstable features
+    opts.unstable_features = UnstableFeatures::Default;
+
     opts
 }
 
@@ -296,14 +296,19 @@ fn build_exec_options(sysroot: Path, libs: Vec<String>) -> Options {
 ///
 /// Returns the LLVM `ModuleRef` and a series of paths to dynamic libraries
 /// for crates used in the given input.
-fn compile_input(input: Input, sysroot: Path, libs: Vec<String>)
+fn compile_input(input: Input, sysroot: PathBuf, libs: Vec<String>)
         -> Option<(llvm::ModuleRef, Deps)> {
-    // Eliminates the useless "task '<...>' panicked" message
-    let task = Builder::new().stderr(Box::new(NullWriter));
+    let task = Builder::new().name("compile_input".to_string());
 
-    let res = task.scoped(move || {
+    let (tx, rx) = channel();
+
+    let handle = task.spawn(move || {
+        if !log_enabled!(::log::LogLevel::Error) {
+            io::set_panic(Box::new(io::sink()));
+        }
         let opts = build_exec_options(sysroot, libs);
         let sess = build_session(opts, None, Registry::new(&rustc::diagnostics::DIAGNOSTICS));
+        rustc_lint::register_builtins(&mut sess.lint_store.borrow_mut(), Some(&sess));
 
         let cfg = build_configuration(&sess);
 
@@ -312,7 +317,7 @@ fn compile_input(input: Input, sysroot: Path, libs: Vec<String>)
         let krate = driver::phase_1_parse_input(&sess, cfg, &input);
 
         let krate = driver::phase_2_configure_and_expand(&sess, krate,
-            &id[], None).expect("phase_2 returned `None`");
+            &id, None).expect("phase_2 returned `None`");
 
         let mut forest = ast_map::Forest::new(krate);
         let arenas = ty::CtxtArenas::new();
@@ -336,26 +341,32 @@ fn compile_input(input: Input, sysroot: Path, libs: Vec<String>)
         // Workaround because raw pointers do not impl Send
         let modp = llmod as usize;
 
-        (modp, deps)
-    }).join();
+        tx.send((modp, deps)).unwrap();
+    }).unwrap();
 
-    match res {
-        Ok((llmod, deps)) => Some((llmod as llvm::ModuleRef, deps)),
-        Err(_) => None,
+    if let Err(_) = handle.join() {
+        return None;
     }
+
+    let (llmod, deps) = rx.recv().unwrap();
+    Some((llmod as llvm::ModuleRef, deps))
 }
 
 /// Compiles input up to phase 3, type/region check analysis, and calls
 /// the given closure with the resulting `CrateAnalysis`.
-fn with_analysis<F, R>(f: F, input: Input, sysroot: Path, libs: Vec<String>) -> Option<R>
-        where F: Send, R: Send,
+fn with_analysis<F, R>(f: F, input: Input, sysroot: PathBuf, libs: Vec<String>) -> Option<R>
+        where F: Send + 'static, R: Send + 'static,
         F: for<'tcx> FnOnce(&ty::CrateAnalysis<'tcx>) -> R {
-    // Eliminates the useless "task '<...>' panicked" message
-    let task = Builder::new().stderr(Box::new(NullWriter));
+    let task = Builder::new().name("with_analysis".to_string());
+    let (tx, rx) = channel();
 
-    let res = task.scoped(move || {
+    let handle = task.spawn(move || {
+        if !log_enabled!(::log::LogLevel::Error) {
+            io::set_panic(Box::new(io::sink()));
+        }
         let opts = build_exec_options(sysroot, libs);
         let sess = build_session(opts, None, Registry::new(&rustc::diagnostics::DIAGNOSTICS));
+        rustc_lint::register_builtins(&mut sess.lint_store.borrow_mut(), Some(&sess));
 
         let cfg = build_configuration(&sess);
 
@@ -364,7 +375,7 @@ fn with_analysis<F, R>(f: F, input: Input, sysroot: Path, libs: Vec<String>) -> 
         let krate = driver::phase_1_parse_input(&sess, cfg, &input);
 
         let krate = driver::phase_2_configure_and_expand(&sess, krate,
-            &id[], None).expect("phase_2 returned `None`");
+            &id, None).expect("phase_2 returned `None`");
 
         let mut forest = ast_map::Forest::new(krate);
         let arenas = ty::CtxtArenas::new();
@@ -373,8 +384,9 @@ fn with_analysis<F, R>(f: F, input: Input, sysroot: Path, libs: Vec<String>) -> 
         let analysis = driver::phase_3_run_analysis_passes(
             sess, ast_map, &arenas, id, MakeGlobMap::No);
 
-        f(&analysis)
-    }).join();
+        tx.send(f(&analysis)).unwrap();
+    }).unwrap();
 
-    res.ok()
+    let _ = handle.join();
+    rx.recv().ok()
 }

@@ -8,22 +8,22 @@
 
 //! Runs Rust code in an encapsulated environment
 
-use std::old_io::File;
-use std::old_io::stdio::stdin_raw;
+use std::env::args;
+use std::fs::File;
 use std::mem::transmute;
-use std::os;
+use std::path::{Path, PathBuf};
 
-use super::exec::ExecutionEngine;
-use super::input::{parse_command, parse_program};
-use super::input::{FileReader, Input, InputReader};
-use super::input::InputResult::*;
+use rustc::middle::ty;
+use rustc::util::ppaux::Repr;
 
-use super::rustc::middle::ty;
-use super::rustc::util::ppaux::Repr;
+use syntax::{ast, codemap, visit};
+use syntax::ast::Stmt_::StmtSemi;
+use syntax::parse::token;
 
-use super::syntax::{ast, codemap, visit};
-use super::syntax::ast::Stmt_::StmtSemi;
-use super::syntax::parse::token;
+use exec::ExecutionEngine;
+use input::{parse_command, parse_program};
+use input::{FileReader, Input, InputReader};
+use input::InputResult::{Command, Program, Empty, More, Eof, InputError};
 
 /// Starting prompt
 const DEFAULT_PROMPT: &'static str = "rusti=> ";
@@ -35,16 +35,47 @@ const BLOCK_PROMPT: &'static str = "rusti+> ";
 // TODO: Implement commands:
 //     def <name>; shows the definition of type or fn
 //     doc <name>; links to rustdoc page for name
-//     help; lists commands and their uses
 
-/// List of command names
-static COMMANDS: &'static [&'static str] = &[
-    "block",
-    "type",
+/// Describes what type of arguments, if any, a command may accept.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum CmdArgs {
+    /// No arguments
+    Nothing,
+    /// Optional unprocessed text may be accepted
+    Text,
+    /// A Rust expression is required
+    Expr,
+}
+
+/// Represents a REPL command definition
+#[derive(Debug)]
+pub struct CommandDef {
+    pub name: &'static str,
+    pub args: Option<&'static str>,
+    pub accepts: CmdArgs,
+    pub help: &'static str,
+}
+
+/// List of commands
+static COMMANDS: &'static [CommandDef] = &[
+    CommandDef{name: "block", args: None,
+        accepts: CmdArgs::Nothing,
+        help: "Run a multi-line block of code, terminated by `.`"},
+    CommandDef{name: "help", args: Some("[command]"),
+        accepts: CmdArgs::Text,
+        help: "Show help for commands"},
+    CommandDef{name: "print", args: Some("<expr>"),
+        accepts: CmdArgs::Expr,
+        help: "Print expression using fmt::Display"},
+    CommandDef{name: "type", args: Some("<expr>"),
+        accepts: CmdArgs::Expr,
+        help: "Show the type of expr"},
 ];
 
 /// Executes input code and maintains state of persistent items.
 pub struct Repl {
+    /// First entry of `env::args`
+    argv0: String,
     engine: ExecutionEngine,
     /// Module-level attributes applied to every program
     attributes: Vec<String>,
@@ -59,11 +90,11 @@ pub struct Repl {
 }
 
 /// Looks up a command name by what may be an abbreviated prefix.
-/// Returns the full command name. e.g. `"b"` => `Some("block")`
-fn lookup_command(name: &str) -> Option<&'static str> {
+/// Returns the `CommandDef` structure if one is found.
+pub fn lookup_command(name: &str) -> Option<&'static CommandDef> {
     for cmd in COMMANDS.iter() {
-        if cmd.starts_with(name) {
-            return Some(*cmd);
+        if cmd.name.starts_with(name) {
+            return Some(cmd);
         }
     }
     None
@@ -71,14 +102,18 @@ fn lookup_command(name: &str) -> Option<&'static str> {
 
 impl Repl {
     /// Constructs a new `Repl`.
-    pub fn new() -> Repl {
-        Repl::new_with_libs(Vec::new())
+    pub fn new(sysroot: Option<PathBuf>) -> Repl {
+        Repl::new_with_libs(Vec::new(), sysroot)
     }
 
     /// Constructs a new `Repl` with additional library lookup paths.
-    pub fn new_with_libs(libs: Vec<String>) -> Repl {
+    pub fn new_with_libs(libs: Vec<String>, sysroot: Option<PathBuf>) -> Repl {
+        let argv0 = args().next()
+            .unwrap_or_else(|| "rusti".to_string());
+
         Repl{
-            engine: ExecutionEngine::new(libs),
+            argv0: argv0,
+            engine: ExecutionEngine::new(libs, sysroot),
             attributes: Vec::new(),
             view_items: Vec::new(),
             items: Vec::new(),
@@ -88,9 +123,8 @@ impl Repl {
 
     /// Evaluates a single round of input, printing the result to `stdout`.
     pub fn eval(&mut self, input: &str) {
-        match parse_program(input, false, None) {
-            Program(i) => self.handle_input(i),
-            _ => (),
+        if let Program(i) = parse_program(input, false, None) {
+            self.handle_input(i, false);
         }
     }
 
@@ -111,18 +145,19 @@ impl Repl {
                 Command(name, args) => {
                     debug!("read command: {} {:?}", name, args);
 
+                    more = false;
                     self.handle_command(name, args);
                 },
                 Program(input) => {
                     debug!("read program: {:?}", input);
 
                     more = false;
-                    self.handle_input(input);
+                    self.handle_input(input, false);
                 },
                 Empty => (),
                 More => { more = true; },
                 Eof => {
-                    if stdin_raw().isatty() {
+                    if stdin_tty() {
                         println!("");
                     }
                     break;
@@ -139,7 +174,7 @@ impl Repl {
 
     /// Runs a single `rusti` command.
     pub fn run_command(&mut self, cmd: &str) {
-        match parse_command(cmd) {
+        match parse_command(cmd, false) {
             Command(name, args) => self.handle_command(name, args),
             InputError(Some(err)) => println!("{}", err),
             _ => ()
@@ -148,11 +183,12 @@ impl Repl {
 
     /// Runs rusti input from the named file.
     /// Returns `true` if it was compiled successfully.
-    pub fn run_file(&mut self, path: Path) -> bool {
-        let f = match File::open(&path) {
+    pub fn run_file(&mut self, path: &Path) -> bool {
+        let f = match File::open(path) {
             Ok(f) => f,
             Err(e) => {
-                println!("{}: {}", os::args()[0], e);
+                println!("{}: failed to open {}: {}",
+                    self.argv0, path.display(), e);
                 return false;
             }
         };
@@ -162,17 +198,17 @@ impl Repl {
         loop {
             if self.read_block {
                 println!("{}: `.block` command is not necessary when running a file",
-                    os::args()[0]);
+                    self.argv0);
                 return false;
             }
 
             let input = input.read_input();
 
             match input {
-                Program(input) => self.handle_input(input),
+                Program(input) => self.handle_input(input, false),
                 Command(name, args) => self.handle_command(name, args),
                 InputError(Some(e)) => {
-                    println!("{}: {}", os::args()[0], e);
+                    println!("{}: {}", self.argv0, e);
                     return false;
                 }
                 InputError(None) => return false,
@@ -189,27 +225,27 @@ impl Repl {
     /// `input` will be ignored.
     fn build_program(&self, input: Option<&Input>, program: &str) -> String {
         let (attrs, vitems, items) = if let Some(input) = input {
-            let attrs = self.attributes.iter().map(|s| &s[])
-                .chain(input.attributes.iter().map(|s| &s[]))
+            let attrs = self.attributes.iter().map(|s| &s[..])
+                .chain(input.attributes.iter().map(|s| &s[..]))
                 .collect::<Vec<_>>();
 
-            let vitems = self.view_items.iter().map(|s| &s[])
-                .chain(input.view_items.iter().map(|s| &s[]))
+            let vitems = self.view_items.iter().map(|s| &s[..])
+                .chain(input.view_items.iter().map(|s| &s[..]))
                 .collect::<Vec<_>>();
 
-            let items = self.items.iter().map(|s| &s[])
-                .chain(input.items.iter().map(|s| &s[]))
+            let items = self.items.iter().map(|s| &s[..])
+                .chain(input.items.iter().map(|s| &s[..]))
                 .collect::<Vec<_>>();
 
             (attrs, vitems, items)
         } else {
-            let attrs = self.attributes.iter().map(|s| &s[])
+            let attrs = self.attributes.iter().map(|s| &s[..])
                 .collect::<Vec<_>>();
 
-            let vitems = self.view_items.iter().map(|s| &s[])
+            let vitems = self.view_items.iter().map(|s| &s[..])
                 .collect::<Vec<_>>();
 
-            let items = self.items.iter().map(|s| &s[])
+            let items = self.items.iter().map(|s| &s[..])
                 .collect::<Vec<_>>();
 
             (attrs, vitems, items)
@@ -235,14 +271,20 @@ r#"#![allow(dead_code, unused_imports, unused_features, unstable_features)]
 
     /// Runs a single command input.
     fn handle_command(&mut self, cmd: String, args: Option<String>) {
-        match lookup_command(&cmd[]) {
+        match lookup_command(&cmd).map(|c| c.name) {
             Some("block") => {
-                if args.is_some() {
-                    println!("command `block` takes no arguments");
-                } else {
-                    self.read_block = true;
-                }
+                self.read_block = true;
             },
+            Some("help") => {
+                self.help_command(args.as_ref().map(|s| &s[..]));
+            }
+            Some("print") => {
+                if let Some(args) = args {
+                    self.print_command(args);
+                } else {
+                    println!("command `print` expects an expression");
+                }
+            }
             Some("type") => {
                 if let Some(args) = args {
                     self.type_command(args);
@@ -255,12 +297,18 @@ r#"#![allow(dead_code, unused_imports, unused_features, unstable_features)]
     }
 
     /// Runs a single program input.
-    fn handle_input(&mut self, mut input: Input) {
+    /// If `display` is `true`, an expression will be printed using the
+    /// `Display` trait; otherwise, it is printed as `Debug`.
+    fn handle_input(&mut self, mut input: Input, display: bool) {
         let name = "_rusti_run";
 
         if input.last_expr && !input.statements.is_empty() {
             let stmt = input.statements.last_mut().unwrap();
-            *stmt = format!(r#"println!("{{:?}}", {{ {} }});"#, stmt);
+            if display {
+                *stmt = format!(r#"println!("{{}}", {{ {} }});"#, stmt);
+            } else {
+                *stmt = format!(r#"println!("{{:?}}", {{ {} }});"#, stmt);
+            }
         }
 
         let stmts = input.statements.connect("\n");
@@ -279,7 +327,7 @@ fn _rusti_inner() {{
 "#
             , name = name
             , stmts = stmts
-            )[]
+            )
         );
 
         if let Some(_) = self.engine.add_module(prog) {
@@ -297,6 +345,43 @@ fn _rusti_inner() {{
             self.attributes.extend(input.attributes.into_iter());
             self.view_items.extend(input.view_items.into_iter());
             self.items.extend(input.items.into_iter());
+        }
+    }
+
+    fn help_command(&self, command: Option<&str>) {
+        if let Some(cmd) = command {
+            match lookup_command(cmd) {
+                None => println!("unrecognized command: {}", cmd),
+                Some(cmd) => {
+                    println!("");
+
+                    match cmd.args {
+                        None => println!("{}", cmd.name),
+                        Some(args) => println!("{} {}", cmd.name, args),
+                    }
+                    println!("  {}", cmd.help);
+                    println!("");
+                }
+            }
+        } else {
+            println!("Available commands:");
+            println!("");
+
+            for cmd in COMMANDS {
+                match cmd.args {
+                    None => println!("  {:<16} {}", cmd.name, cmd.help),
+                    Some(args) => println!("  {:<16} {}",
+                        format!("{} {}", cmd.name, args), cmd.help)
+                }
+            }
+
+            println!("");
+        }
+    }
+
+    fn print_command(&mut self, expr: String) {
+        if let Program(i) = parse_program(&expr, false, None) {
+            self.handle_input(i, true);
         }
     }
 
@@ -324,14 +409,14 @@ fn _rusti_inner() {{
         let name = "_rusti_type";
         let prog = self.build_program(None, &format!(
 r#"
-#[allow(path_statements)]
+#[allow(path_statements, unused_must_use)]
 fn {name}() {{
 {expr} ;
 }}
 "#
         , name = name
         , expr = expr
-        )[]);
+        ));
 
         if let Some(t) = self.expr_type(name, prog) {
             println!("{} = {}", expr, t);
@@ -349,11 +434,11 @@ impl<'v, 'a, 'tcx> visit::Visitor<'v> for ExprType<'a, 'tcx> {
     fn visit_fn(&mut self, fk: visit::FnKind<'v>, _fd: &'v ast::FnDecl,
             b: &'v ast::Block, _s: codemap::Span, _n: ast::NodeId) {
         if let visit::FkItemFn(ident, _, _, _) = fk {
-            if token::get_ident(ident).get() == self.fn_name {
+            if &*token::get_ident(ident) == self.fn_name {
                 if let Some(ref stmt) = b.stmts.last() {
                     if let StmtSemi(ref expr, _) = stmt.node {
                         let id = expr.id;
-                        if let Some(ty) = self.ty_cx.node_types.borrow().get(&id) {
+                        if let Some(ty) = self.ty_cx.node_types().get(&id) {
                             self.result = Some(ty.repr(self.ty_cx));
                         }
                     }
@@ -362,3 +447,12 @@ impl<'v, 'a, 'tcx> visit::Visitor<'v> for ExprType<'a, 'tcx> {
         }
     }
 }
+
+#[cfg(unix)]
+fn stdin_tty() -> bool {
+    use libc::{isatty, STDIN_FILENO};
+    unsafe { isatty(STDIN_FILENO) != 0 }
+}
+
+#[cfg(not(unix))]
+fn stdin_tty() -> bool { false }
